@@ -205,6 +205,20 @@ class FAISSVectorStore:
             logger.error(f"Ошибка при загрузке индекса: {e}")
             return False
     
+    @staticmethod
+    def _unique_source_file_count(metadata: list) -> int:
+        """Число уникальных исходных .txt (без учёта разбиения на части)."""
+        if not metadata:
+            return 0
+        bases = set()
+        for item in metadata:
+            s = (item.get("source") or "").strip()
+            if not s:
+                continue
+            base = s.split(" (часть")[0].strip() if " (часть" in s else s
+            bases.add(base)
+        return len(bases)
+
     def get_stats(self) -> dict:
         """
         Возвращает статистику по векторному хранилищу.
@@ -212,11 +226,14 @@ class FAISSVectorStore:
         Returns:
             Словарь со статистикой
         """
+        n_chunks = len(self.metadata)
+        n_vectors = self.index.ntotal if self.index else 0
         return {
-            "total_vectors": self.index.ntotal if self.index else 0,
-            "total_documents": len(self.metadata),
+            "total_vectors": n_vectors,
+            "total_chunks": n_chunks,
+            "unique_source_files": self._unique_source_file_count(self.metadata),
             "dimension": self.index.d if self.index else 0,
             "index_exists": self.index_path.exists(),
-            "metadata_exists": self.metadata_path.exists()
+            "metadata_exists": self.metadata_path.exists(),
         }
 

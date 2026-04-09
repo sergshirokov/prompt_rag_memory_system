@@ -6,6 +6,7 @@ Telegram-бот с RAG-функциональностью на основе Prox
 """
 
 import asyncio
+import html
 import logging
 from pathlib import Path
 from typing import List
@@ -42,6 +43,13 @@ logger.info("RAG Pipeline готов к работе")
 # Структура: {user_id: [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
 conversation_history = {}
 MAX_HISTORY_LENGTH = 10  # Максимум последних сообщений для контекста
+
+
+def html_escape(text: str | None) -> str:
+    """Экранирование для Telegram HTML (динамический текст из LLM/пользователя)."""
+    if text is None:
+        return ""
+    return html.escape(str(text), quote=False)
 
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
@@ -100,7 +108,7 @@ def chunk_text(text: str, max_chars: int = 6000) -> List[str]:
     return chunks
 
 
-def load_documents_from_directory(directory: Path) -> tuple[List[str], List[str]]:
+def load_documents_from_directory(directory: Path) -> tuple[List[str], List[str], int]:
     """
     Загружает все текстовые документы из директории.
     Большие документы разбиваются на части (chunks).
@@ -109,17 +117,20 @@ def load_documents_from_directory(directory: Path) -> tuple[List[str], List[str]
         directory: Путь к директории с документами
         
     Returns:
-        Кортеж (тексты документов, имена файлов)
+        Кортеж (тексты чанков, подписи источников, число исходных .txt файлов)
     """
     documents = []
     sources = []
     
     if not directory.exists():
         logger.warning(f"Директория {directory} не существует")
-        return documents, sources
+        return documents, sources, 0
     
+    txt_files = sorted(directory.glob("*.txt"))
+    source_file_count = len(txt_files)
+
     # Ищем все .txt файлы
-    for file_path in directory.glob("*.txt"):
+    for file_path in txt_files:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read()
@@ -140,11 +151,19 @@ def load_documents_from_directory(directory: Path) -> tuple[List[str], List[str]
         except Exception as e:
             logger.error(f"Ошибка при чтении файла {file_path}: {e}")
     
-    logger.info(f"Всего загружено документов/частей: {len(documents)}")
-    return documents, sources
+    logger.info(
+        f"Всего: исходных .txt: {source_file_count}, "
+        f"чанков для индекса: {len(documents)}"
+    )
+    return documents, sources, source_file_count
 
 
-async def send_long_message(message: Message, text: str, max_length: int = 4000):
+async def send_long_message(
+    message: Message,
+    text: str,
+    max_length: int = 4000,
+    parse_mode: str | None = None,
+):
     """
     Отправляет длинное сообщение, разбивая его на части если нужно.
     
@@ -152,15 +171,20 @@ async def send_long_message(message: Message, text: str, max_length: int = 4000)
         message: Исходное сообщение для ответа
         text: Текст для отправки
         max_length: Максимальная длина одного сообщения
+        parse_mode: Режим разметки (например ParseMode.HTML), если нужен
     """
+    send_kwargs = {}
+    if parse_mode is not None:
+        send_kwargs["parse_mode"] = parse_mode
+
     if len(text) <= max_length:
-        await message.answer(text)
+        await message.answer(text, **send_kwargs)
         return
     
     # Разбиваем на части
     parts = [text[i:i+max_length] for i in range(0, len(text), max_length)]
     for part in parts:
-        await message.answer(part)
+        await message.answer(part, **send_kwargs)
         await asyncio.sleep(0.5)
 
 
@@ -187,7 +211,7 @@ async def cmd_start(message: Message):
 <b>Доступные команды:</b>
 /start - Показать это сообщение
 /help - Подробная справка
-/ask <вопрос> - Задать вопрос с поиском в базе знаний
+/ask &lt;вопрос&gt; - Задать вопрос с поиском в базе знаний
 /ingest - Перезагрузить базу знаний (только для администраторов)
 /stats - Показать статистику системы
 /test - Проверить подключение к ProxyAPI
@@ -229,7 +253,7 @@ RAG - это технология, которая позволяет мне на
 Пример: отправьте фото документа с подписью "Что это значит?"
 
 <b>3️⃣ Команды</b>
-/ask <вопрос> - Явный RAG-запрос
+/ask &lt;вопрос&gt; - Явный RAG-запрос
 Пример: /ask Как работает векторный поиск?
 
 /ingest - Перезагрузка базы знаний
@@ -287,10 +311,10 @@ async def cmd_ask(message: Message):
         result = rag_pipeline.query(query)
         
         # Формируем ответ БЕЗ источников
-        response_text = f"<b>💡 Ответ:</b>\n{result['answer']}"
+        response_text = f"<b>💡 Ответ:</b>\n{html_escape(result['answer'])}"
         
         await processing_msg.delete()
-        await send_long_message(message, response_text)
+        await send_long_message(message, response_text, parse_mode=ParseMode.HTML)
         
         logger.info(f"Ответ отправлен пользователю {message.from_user.id}")
         
@@ -310,7 +334,7 @@ async def cmd_ingest(message: Message):
     await message.answer("📥 Начинаю индексацию документов через ProxyAPI...")
     
     try:
-        documents, sources = load_documents_from_directory(DOCS_PATH)
+        documents, sources, source_file_count = load_documents_from_directory(DOCS_PATH)
         
         if not documents:
             await message.answer(
@@ -319,7 +343,11 @@ async def cmd_ingest(message: Message):
             )
             return
         
-        await message.answer(f"📄 Найдено документов: {len(documents)}\nНачинаю обработку...")
+        await message.answer(
+            f"📄 Исходных файлов (.txt): {source_file_count}\n"
+            f"📄 Чанков для индексации: {len(documents)}\n"
+            "Начинаю обработку..."
+        )
         
         success = rag_pipeline.index_documents(documents, sources)
         
@@ -328,10 +356,10 @@ async def cmd_ingest(message: Message):
             response = (
                 "✅ <b>Индексация завершена успешно!</b>\n\n"
                 f"📊 Статистика:\n"
-                f"• Документов: {stats['total_documents']}\n"
-                f"• Векторов: {stats['total_vectors']}\n"
-                f"• Размерность: {stats['dimension']}\n"
-                f"• API: {stats['api_url']}\n\n"
+                f"• Исходных файлов (.txt): {stats['unique_source_files']}\n"
+                f"• Чанков в индексе (по одному эмбеддингу на чанк): {stats['total_chunks']}\n"
+                f"• Размерность векторов: {stats['dimension']}\n"
+                f"• API: {html_escape(stats['api_url'])}\n\n"
                 f"Бот готов к работе! Задавайте вопросы. 💬"
             )
             await message.answer(response, parse_mode=ParseMode.HTML)
@@ -367,17 +395,17 @@ async def cmd_stats(message: Message):
 {status_emoji} {status_text}
 
 <b>Данные:</b>
-• Документов: {stats['total_documents']}
-• Векторов: {stats['total_vectors']}
-• Размерность: {stats['dimension']}
+• Исходных файлов (.txt): {stats['unique_source_files']}
+• Чанков в индексе: {stats['total_chunks']}
+• Размерность векторов: {stats['dimension']}
 
 <b>Модели:</b>
-• Чат: {stats['chat_model']}
-• Vision: {stats['vision_model']}
-• Эмбеддинги: {stats['embed_model']}
+• Чат: {html_escape(stats['chat_model'])}
+• Vision: {html_escape(stats['vision_model'])}
+• Эмбеддинги: {html_escape(stats['embed_model'])}
 
 <b>API:</b>
-• URL: {stats['api_url']}
+• URL: {html_escape(stats['api_url'])}
 
 <b>Файлы:</b>
 • Индекс: {'✅' if stats['index_exists'] else '❌'}
@@ -464,13 +492,13 @@ async def handle_photo(message: Message):
         
         # Формируем ответ БЕЗ источников
         response_text = "<b>📄 Текст с изображения:</b>\n"
-        response_text += result['extracted_text'] + "\n\n"
+        response_text += html_escape(result.get("extracted_text")) + "\n\n"
         
         if result.get('rag_answer'):
-            response_text += f"<b>💡 Ответ на ваш вопрос:</b>\n{result['rag_answer']}"
+            response_text += f"<b>💡 Ответ на ваш вопрос:</b>\n{html_escape(result['rag_answer'])}"
         
         await processing_msg.delete()
-        await send_long_message(message, response_text)
+        await send_long_message(message, response_text, parse_mode=ParseMode.HTML)
         
         logger.info(f"Изображение обработано для пользователя {message.from_user.id}")
         
@@ -540,7 +568,10 @@ async def main():
     logger.info(f"API URL: {stats['api_url']}")
     
     if stats['is_loaded']:
-        logger.info(f"✅ База знаний загружена: {stats['total_documents']} документов")
+        logger.info(
+            f"✅ База знаний загружена: {stats['unique_source_files']} .txt, "
+            f"{stats['total_chunks']} чанков"
+        )
     else:
         logger.warning("⚠️ База знаний не загружена. Выполните команду /ingest")
     
