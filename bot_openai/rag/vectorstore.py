@@ -208,7 +208,37 @@ class FAISSVectorStore:
             
         except Exception as e:
             logger.error(f"Ошибка при загрузке индекса: {e}")
-            return False
+            # Пробуем альтернативный метод для Windows с кириллицей в пути
+            try:
+                import tempfile
+                import shutil
+                
+                logger.info("Пытаемся загрузить через временный файл...")
+                
+                # Копируем индекс во временный ASCII-путь и читаем оттуда
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.faiss') as tmp_file:
+                    temp_path = Path(tmp_file.name)
+                
+                shutil.copy2(str(self.index_path), str(temp_path))
+                self.index = faiss.read_index(str(temp_path))
+                
+                # Чистим временный файл
+                temp_path.unlink(missing_ok=True)
+                
+                logger.info(f"FAISS индекс загружен через временный файл из {self.index_path}")
+                logger.info(f"Количество векторов в индексе: {self.index.ntotal}")
+                
+                # Загружаем метаданные обычным способом
+                with open(self.metadata_path, 'r', encoding='utf-8') as f:
+                    self.metadata = json.load(f)
+                logger.info(f"Метаданные загружены из {self.metadata_path}")
+                logger.info(f"Количество документов в метаданных: {len(self.metadata)}")
+                
+                return True
+                
+            except Exception as e2:
+                logger.error(f"Не удалось загрузить даже через временный файл: {e2}")
+                return False
     
     @staticmethod
     def _unique_source_file_count(metadata: list) -> int:
